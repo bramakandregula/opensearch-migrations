@@ -71,6 +71,7 @@ skip_setting_k8s_context=false
 skip_test_images=false
 image_tag="latest"
 kubectl_context=""
+solr_replayer_version=""
 
 # --- argument parsing ---
 while [[ $# -gt 0 ]]; do
@@ -111,6 +112,7 @@ while [[ $# -gt 0 ]]; do
     --image-tag) image_tag="$2"; shift 2 ;;
     --tls-mode) tls_mode="$2"; shift 2 ;;
     --pca-arn) pca_arn="$2"; shift 2 ;;
+    --solr-replayer-version) solr_replayer_version="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [options]"
       echo ""
@@ -192,6 +194,14 @@ while [[ $# -gt 0 ]]; do
       echo "                                            pca-create   - Create a new AWS Private CA via ACK"
       echo "  --pca-arn <arn>                           ARN of existing AWS Private CA"
       echo "                                            (required with --tls-mode pca-existing)"
+      echo ""
+      echo "Solr migration options:"
+      echo "  --solr-replayer-version <ver>             Use the custom Solr replayer image at the specified version."
+      echo "                                            Reads solr-replayer-compatibility.json to resolve the"
+      echo "                                            compatible MA version for other images (capture proxy,"
+      echo "                                            console, reindex-from-snapshot). Overrides --version."
+      echo "                                            Use 'latest' to use the default from the config file."
+      echo "                                            Example: --solr-replayer-version 3.2.1-aws.latest"
       echo ""
       echo "Examples:"
       echo "  # Mode 1 — Default: download latest release artifacts, create new VPC:"
@@ -347,6 +357,12 @@ validate_args() {
     echo "  --version downloads published artifacts for a specific release." >&2
     exit 1
   fi
+  # --solr-replayer-version and --build are mutually exclusive
+  if [[ -n "$solr_replayer_version" && "$build" == "true" ]]; then
+    echo "Error: --solr-replayer-version and --build are mutually exclusive." >&2
+    echo "  --solr-replayer-version uses pre-built images from the compatibility config." >&2
+    exit 1
+  fi
   if [[ -n "$create_vpc_endpoints" && "$deploy_import_vpc" != "true" ]]; then
     echo "Error: --create-vpc-endpoints is only valid with --deploy-import-vpc-cfn." >&2
     exit 1
@@ -429,8 +445,46 @@ if [[ "$create_vpc_endpoints" == "all" ]]; then
 fi
 
 # --- resolve version once ---
+# When --solr-replayer-version is specified, read the compatibility config to
+# determine the MA version for companion images. This overrides --version and
+# the GitHub latest-release lookup entirely.
+SOLR_REPLAYER_REGISTRY=""
+SOLR_REPLAYER_TAG=""
+
+if [[ -n "$solr_replayer_version" ]]; then
+  SOLR_COMPAT_FILE="$(dirname "${BASH_SOURCE[0]}")/solr-replayer-compatibility.json"
+  if [[ ! -f "$SOLR_COMPAT_FILE" ]]; then
+    echo "Error: solr-replayer-compatibility.json not found at $SOLR_COMPAT_FILE" >&2
+    exit 1
+  fi
+
+  # Resolve "latest" pointer if user passed --solr-replayer-version latest
+  if [[ "$solr_replayer_version" == "latest" ]]; then
+    solr_replayer_version=$(jq -r '.latest' "$SOLR_COMPAT_FILE")
+    [[ -n "$solr_replayer_version" && "$solr_replayer_version" != "null" ]] \
+      || { echo "Error: 'latest' key not found in $SOLR_COMPAT_FILE"; exit 1; }
+    echo "Resolved Solr replayer 'latest' to: $solr_replayer_version"
+  fi
+
+  # Look up the release entry
+  SOLR_ENTRY=$(jq -r --arg v "$solr_replayer_version" '.releases[$v] // empty' "$SOLR_COMPAT_FILE")
+  if [[ -z "$SOLR_ENTRY" ]]; then
+    echo "Error: Version '$solr_replayer_version' not found in $SOLR_COMPAT_FILE" >&2
+    echo "Available versions:" >&2
+    jq -r '.releases | keys[]' "$SOLR_COMPAT_FILE" >&2
+    exit 1
+  fi
+
+  SOLR_REPLAYER_REGISTRY=$(echo "$SOLR_ENTRY" | jq -r '.replayer.registry')
+  SOLR_REPLAYER_TAG=$(echo "$SOLR_ENTRY" | jq -r '.replayer.tag')
+  RELEASE_VERSION=$(echo "$SOLR_ENTRY" | jq -r '.maVersion')
+
+  echo "Solr replayer version: $solr_replayer_version"
+  echo "  Replayer image: ${SOLR_REPLAYER_REGISTRY}:${SOLR_REPLAYER_TAG}"
+  echo "  Compatible MA version (for other images): ${RELEASE_VERSION}"
+
 # Skip version resolution when building everything from source (--build)
-if [[ "$build" == "true" ]]; then
+elif [[ "$build" == "true" ]]; then
   RELEASE_VERSION="local-build"
   echo "Building all artifacts from source (no release version needed)"
 elif [[ -z "$version" || "$version" == "latest" ]]; then
@@ -964,6 +1018,11 @@ migration_console|console"
     if [[ -n "${ma_images_source:-}" ]]; then
       # Copy from another ECR registry using build tag names
       echo "$MA_IMAGES" | while IFS='|' read -r build_name _; do
+        # When using custom Solr replayer, skip the replayer from ma_images_source
+        if [[ "$build_name" == "traffic_replayer" && -n "$SOLR_REPLAYER_REGISTRY" ]]; then
+          echo "  $build_name → skipped (using custom Solr replayer)"
+          continue
+        fi
         src="${ma_images_source}:migrations_${build_name}_latest"
         dst="${MIGRATIONS_ECR_REGISTRY}:migrations_${build_name}_latest"
         echo "  $build_name → $dst"
@@ -973,6 +1032,11 @@ migration_console|console"
       # Copy from public ECR, trying pull-through cache first when available
       _ecr_public_authed=false
       echo "$MA_IMAGES" | while IFS='|' read -r build_name public_suffix; do
+        # When using custom Solr replayer, skip the vanilla replayer
+        if [[ "$build_name" == "traffic_replayer" && -n "$SOLR_REPLAYER_REGISTRY" ]]; then
+          echo "  $public_suffix → skipped (using custom Solr replayer)"
+          continue
+        fi
         dst="${MIGRATIONS_ECR_REGISTRY}:migrations_${build_name}_latest"
         echo "  $public_suffix → $dst"
         if [[ -n "${ECR_PULL_THROUGH_ENDPOINT:-}" ]] && \
@@ -986,6 +1050,18 @@ migration_console|console"
         fi
         crane_copy_retry "public.ecr.aws/opensearchproject/opensearch-migrations-${public_suffix}:${RELEASE_VERSION}" "$dst"
       done
+    fi
+
+    # Mirror custom Solr replayer image to private ECR
+    if [[ -n "$SOLR_REPLAYER_REGISTRY" ]]; then
+      echo "Mirroring custom Solr replayer image..."
+      src="${SOLR_REPLAYER_REGISTRY}:${SOLR_REPLAYER_TAG}"
+      dst="${MIGRATIONS_ECR_REGISTRY}:migrations_traffic_replayer_latest"
+      echo "  ${src} → ${dst}"
+      # Authenticate to the custom public ECR gallery if needed
+      aws ecr-public get-login-password --region us-east-1 2>/dev/null | \
+        crane auth login public.ecr.aws -u AWS --password-stdin 2>/dev/null || true
+      crane_copy_retry "$src" "$dst"
     fi
     # Tag mirrored images with the immutable IMAGE_TAG
     echo "Tagging MA images with $IMAGE_TAG..."
@@ -1064,11 +1140,19 @@ if [[ "$use_public_images" == "false" ]]; then
 # Use latest public images
 else
   echo "Using public images tagged '$RELEASE_VERSION'"
+  # When using custom Solr replayer, override the replayer image source
+  if [[ -n "$SOLR_REPLAYER_REGISTRY" ]]; then
+    REPLAYER_REPO="$SOLR_REPLAYER_REGISTRY"
+    REPLAYER_TAG="$SOLR_REPLAYER_TAG"
+  else
+    REPLAYER_REPO="public.ecr.aws/opensearchproject/opensearch-migrations-traffic-replayer"
+    REPLAYER_TAG="$RELEASE_VERSION"
+  fi
   IMAGE_FLAGS="\
     --set images.captureProxy.repository=public.ecr.aws/opensearchproject/opensearch-migrations-traffic-capture-proxy \
     --set images.captureProxy.tag=$RELEASE_VERSION \
-    --set images.trafficReplayer.repository=public.ecr.aws/opensearchproject/opensearch-migrations-traffic-replayer \
-    --set images.trafficReplayer.tag=$RELEASE_VERSION \
+    --set images.trafficReplayer.repository=${REPLAYER_REPO} \
+    --set images.trafficReplayer.tag=${REPLAYER_TAG} \
     --set images.reindexFromSnapshot.repository=public.ecr.aws/opensearchproject/opensearch-migrations-reindex-from-snapshot \
     --set images.reindexFromSnapshot.tag=$RELEASE_VERSION \
     --set images.migrationConsole.repository=public.ecr.aws/opensearchproject/opensearch-migrations-console \
